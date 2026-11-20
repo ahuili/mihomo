@@ -419,12 +419,32 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 
 // processUDP starts a loop to handle udp packet
 func processUDP(queue chan C.PacketAdapter) {
-	for conn := range queue {
-		handleUDPConn(conn)
+	var batch [32]C.PacketAdapter
+	for first := range queue {
+		// Take only packets already waiting. Idle traffic incurs no batching delay.
+		count := len(queue)
+		if count >= len(batch) {
+			count = len(batch) - 1
+		}
+		if !scopedRoutingEnabled || count == 0 {
+			handleUDPConn(first, nil)
+			continue
+		}
+		batch[0] = first
+		for i := 1; i <= count; i++ {
+			batch[i] = <-queue
+		}
+		// Every packet in this batch arrived before the socket table lookup.
+		// Never carry a path across a later arrival or a different source tuple.
+		owners := make(map[netip.AddrPort]string)
+		for i := 0; i <= count; i++ {
+			handleUDPConn(batch[i], owners)
+			batch[i] = nil
+		}
 	}
 }
 
-func handleUDPConn(packet C.PacketAdapter) {
+func handleUDPConn(packet C.PacketAdapter, owners map[netip.AddrPort]string) {
 	if !isHandle(packet.Metadata().Type) {
 		packet.Drop()
 		return
@@ -446,7 +466,15 @@ func handleUDPConn(packet C.PacketAdapter) {
 	}
 
 	if scopedRoutingEnabled && metadata.Type == C.TUN {
-		handleScopedUDP(packet, prepared)
+		source := netip.AddrPortFrom(prepared.SrcIP.Unmap(), prepared.SrcPort)
+		path, known := owners[source]
+		if !known {
+			path = scopedPacketIdentity(prepared)
+			if owners != nil {
+				owners[source] = path
+			}
+		}
+		handleScopedUDP(packet, prepared, path)
 		return
 	}
 

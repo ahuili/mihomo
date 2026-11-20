@@ -37,8 +37,7 @@ func scopedPacketIdentity(metadata *C.Metadata) string {
 	return path
 }
 
-func handleScopedUDP(packet C.PacketAdapter, prepared *C.Metadata) {
-	path := scopedPacketIdentity(prepared)
+func handleScopedUDP(packet C.PacketAdapter, prepared *C.Metadata, path string) {
 	key := scopedUDPKey{packet.Key(), path, prepared.RuleHost(), packet.Metadata().RemoteAddress()}
 	// Admission happens even on cache hits. The persistent registration on the
 	// association covers queued packets and the interval before a dial returns.
