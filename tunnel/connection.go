@@ -14,9 +14,10 @@ import (
 )
 
 type packetSender struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	ch     chan C.PacketAdapter
+	ctx       context.Context
+	cancel    context.CancelFunc
+	ch        chan C.PacketAdapter
+	enqueueMu sync.Mutex
 
 	// destination NAT mapping
 	originToTarget map[string]netip.Addr
@@ -127,6 +128,8 @@ func (s *packetSender) dropAll() {
 }
 
 func (s *packetSender) Send(packet C.PacketAdapter) {
+	s.enqueueMu.Lock()
+	defer s.enqueueMu.Unlock()
 	select {
 	case <-s.ctx.Done():
 		packet.Drop() // sender closed before Send()
@@ -145,6 +148,8 @@ func (s *packetSender) Send(packet C.PacketAdapter) {
 }
 
 func (s *packetSender) Close() {
+	s.enqueueMu.Lock()
+	defer s.enqueueMu.Unlock()
 	s.cancel()
 	s.dropAll()
 }
@@ -173,6 +178,10 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
 		natTable.Delete(key)
 	}()
 
+	readUDPReplies(writeBack, pc, sender, oAddrPort)
+}
+
+func readUDPReplies(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSender, oAddrPort netip.AddrPort) {
 	for {
 		_ = pc.SetReadDeadline(time.Now().Add(udpTimeout))
 		data, put, from, err := pc.WaitReadFrom()

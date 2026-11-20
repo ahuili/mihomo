@@ -20,6 +20,7 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/ntp"
+	"github.com/metacubex/mihomo/tunnel"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 
 	"github.com/metacubex/chi"
@@ -283,12 +284,20 @@ func startUnix(cfg *Config) {
 			log.Errorln("External controller unix listen error: %s", err)
 			return
 		}
-		_ = os.Chmod(addr, 0o666)
-		log.Infoln("RESTful API unix listening at: %s", l.Addr().String())
-
-		server := &http.Server{
-			Handler: router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors),
+		handler := router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors)
+		if tunnel.ScopedRoutingEnabled() {
+			// This API is local-only. Avoid the default world-accessible socket.
+			if err := os.Chmod(addr, 0600); err != nil {
+				_ = l.Close()
+				log.Errorln("Unable to secure scoped controller: %s", err)
+				return
+			}
+			handler.Mount("/routing-scopes", scopeRouter())
+		} else {
+			_ = os.Chmod(addr, 0666)
 		}
+		log.Infoln("RESTful API unix listening at: %s", l.Addr().String())
+		server := &http.Server{Handler: handler}
 		unixServer = server
 		if err = server.Serve(l); err != nil {
 			log.Errorln("External controller unix serve error: %s", err)

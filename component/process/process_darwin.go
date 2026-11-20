@@ -34,6 +34,15 @@ var structSize = func() int {
 }()
 
 func findProcessName(network string, ip netip.Addr, port int) (uint32, string, error) {
+	return findDarwinProcess(network, ip, port, false)
+}
+
+func FindUniqueSocketPath(network string, ip netip.Addr, port int) (string, error) {
+	_, path, err := findDarwinProcess(network, ip, port, true)
+	return path, err
+}
+
+func findDarwinProcess(network string, ip netip.Addr, port int, unique bool) (uint32, string, error) {
 	var spath string
 	switch network {
 	case TCP:
@@ -59,6 +68,7 @@ func findProcessName(network string, ip netip.Addr, port int) (uint32, string, e
 	}
 
 	var fallbackUDPProcess string
+	var owner uniqueUDPPath
 	// skip the first xinpgen(24 bytes) block
 	for i := 24; i+itemSize <= len(buf); i += itemSize {
 		// offset of xinpcb_n and xsocket_n
@@ -89,6 +99,15 @@ func findProcessName(network string, ip netip.Addr, port int) (uint32, string, e
 		}
 		srcIP = srcIP.Unmap()
 
+		if unique {
+			if ip == srcIP || (network == UDP && srcIP.IsUnspecified() && isIPv4 == srcIsIPv4) {
+				path, err := getExecPathFromPID(readNativeUint32(buf[so+68 : so+72]))
+				if !owner.add(path, err) {
+					return 0, "", ErrNotFound
+				}
+			}
+			continue
+		}
 		if ip == srcIP {
 			// xsocket_n.so_last_pid
 			pid := readNativeUint32(buf[so+68 : so+72])
@@ -102,6 +121,9 @@ func findProcessName(network string, ip netip.Addr, port int) (uint32, string, e
 		}
 	}
 
+	if unique && owner.path != "" {
+		return 0, owner.path, nil
+	}
 	if network == UDP && fallbackUDPProcess != "" {
 		return 0, fallbackUDPProcess, nil
 	}

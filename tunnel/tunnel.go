@@ -353,7 +353,14 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 				attemptProcessLookup = false
 				if !features.CMFA {
 					// normal check for process
-					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+					var uid uint32
+					var path string
+					var err error
+					if scopedRoutingEnabled && metadata.Type == C.TUN && metadata.NetWork == C.TCP {
+						path, err = process.FindUniqueSocketPath(process.TCP, metadata.SrcIP.Unmap(), int(metadata.SrcPort))
+					} else {
+						uid, path, err = process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+					}
 					if err != nil {
 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
 					} else {
@@ -431,9 +438,15 @@ func handleUDPConn(packet C.PacketAdapter) {
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
-	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
+	prepared := metadata.Clone()
+	if err := preHandleMetadata(prepared); err != nil { // precheck without modify metadata
 		packet.Drop()
 		log.Debugln("[Metadata PreHandle] error: %s", err)
+		return
+	}
+
+	if scopedRoutingEnabled && metadata.Type == C.TUN {
+		handleScopedUDP(packet, prepared)
 		return
 	}
 
@@ -446,57 +459,63 @@ func handleUDPConn(packet C.PacketAdapter) {
 		return sender
 	})
 	if !loaded {
-		dial := func() (C.PacketConn, C.WriteBackProxy, error) {
-			originMetadata := metadata  // save origin metadata
-			metadata = metadata.Clone() // don't modify PacketAdapter's metadata
-
-			if err := sender.DoSniff(metadata); err != nil {
-				log.Warnln("[UDP] DoSniff error: %s", err.Error())
-				return nil, nil, err
-			}
-
-			_ = preHandleMetadata(metadata) // error was pre-checked
-
-			proxy, rule, err := resolveMetadata(metadata)
-			if err != nil {
-				log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
-				return nil, nil, err
-			}
-
-			dialMetadata := metadata.Pure()
-			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
-			defer cancel()
-			rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
-				return proxy.ListenPacketContext(ctx, dialMetadata)
-			}, func(err error) {
-				logMetadataErr(metadata, rule, proxy, err)
-			})
-			if err != nil {
-				return nil, nil, err
-			}
-			logMetadata(metadata, rule, rawPc)
-
-			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
-
-			sender.AddMapping(originMetadata, dialMetadata)
-			oAddrPort := dialMetadata.AddrPort()
-			writeBackProxy := nat.NewWriteBackProxy(packet)
-
-			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
-			return pc, writeBackProxy, nil
-		}
-
 		go func() {
-			pc, proxy, err := dial()
+			var oAddrPort netip.AddrPort
+			pc, proxy, err := dialUDPAssociation(context.Background(), packet, sender, nil, &oAddrPort)
 			if err != nil {
 				sender.Close()
 				natTable.Delete(key)
 				return
 			}
+			go handleUDPToLocal(proxy, pc, sender, key, oAddrPort)
 			sender.Process(pc, proxy)
 		}()
 	}
 	sender.Send(packet) // nonblocking
+}
+
+func dialUDPAssociation(parent context.Context, packet C.PacketAdapter, sender C.PacketSender, admit func(string) bool, oAddrPort *netip.AddrPort) (C.PacketConn, C.WriteBackProxy, error) {
+	metadata := packet.Metadata()
+	originMetadata := metadata  // save origin metadata
+	metadata = metadata.Clone() // don't modify PacketAdapter's metadata
+
+	if err := sender.DoSniff(metadata); err != nil {
+		log.Warnln("[UDP] DoSniff error: %s", err.Error())
+		return nil, nil, err
+	}
+
+	_ = preHandleMetadata(metadata) // error was pre-checked
+
+	if admit != nil && !admit(metadata.RuleHost()) {
+		return nil, nil, context.Canceled
+	}
+	if err := parent.Err(); err != nil {
+		return nil, nil, err
+	}
+	proxy, rule, err := resolveMetadata(metadata)
+	if err != nil {
+		log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
+		return nil, nil, err
+	}
+
+	dialMetadata := metadata.Pure()
+	ctx, cancel := context.WithTimeout(parent, C.DefaultUDPTimeout)
+	defer cancel()
+	rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
+		return proxy.ListenPacketContext(ctx, dialMetadata)
+	}, func(err error) {
+		logMetadataErr(metadata, rule, proxy, err)
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	logMetadata(metadata, rule, rawPc)
+
+	pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
+
+	sender.AddMapping(originMetadata, dialMetadata)
+	*oAddrPort = dialMetadata.AddrPort()
+	return pc, nat.NewWriteBackProxy(packet), nil
 }
 
 func handleTCPConn(connCtx C.ConnContext) {
@@ -557,6 +576,39 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 
+	dialCtx := context.Background()
+	var owned *scopedTCP
+	if scopedRoutingEnabled && metadata.Type == C.TUN {
+		var cancel context.CancelFunc
+		dialCtx, cancel = context.WithCancel(dialCtx)
+		defer cancel()
+		owned = &scopedTCP{in: conn, cancel: cancel}
+		flow, outbound, ok := scopedFlows.Enter(metadata.ProcessPath, metadata.RuleHost(), false, owned.stop)
+		if !ok {
+			return
+		}
+		defer flow.Done()
+		if metadata.Host != "" && metadata.Host != metadata.RuleHost() {
+			alias, alternate, ok := scopedFlows.Enter(metadata.ProcessPath, metadata.Host, false, owned.stop)
+			if !ok {
+				return
+			}
+			defer alias.Done()
+			if alternate != "" {
+				if outbound != "" && alternate != outbound {
+					return
+				}
+				outbound = alternate
+			}
+		}
+		if outbound != "" {
+			proxy = scopedOutbound(outbound)
+			if proxy == nil {
+				return
+			}
+			rule = nil
+		}
+	}
 	dialMetadata := metadata
 	if len(metadata.Host) > 0 {
 		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
@@ -571,7 +623,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	var peekBytes []byte
 	var peekLen int
 
-	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
+	ctx, cancel := context.WithTimeout(dialCtx, C.DefaultTCPTimeout)
 	defer cancel()
 	remoteConn, err := retry(ctx, func(ctx context.Context) (remoteConn C.Conn, err error) {
 		remoteConn, err = proxy.DialContext(ctx, dialMetadata)
@@ -579,6 +631,10 @@ func handleTCPConn(connCtx C.ConnContext) {
 			return
 		}
 
+		if owned != nil && !owned.attach(remoteConn) {
+			_ = remoteConn.Close()
+			return nil, context.Canceled
+		}
 		if N.NeedHandshake(remoteConn) {
 			defer func() {
 				if err != nil {
