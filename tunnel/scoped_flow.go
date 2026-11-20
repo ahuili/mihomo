@@ -30,11 +30,12 @@ type scopeRule struct {
 	outbound string
 }
 type scopeRegistry struct {
-	mu      sync.Mutex
-	file    string
-	loadErr error
-	rules   map[string]*scopeRule
-	flows   map[*scopeFlow]struct{}
+	mu            sync.Mutex
+	file          string
+	loadErr       error
+	rules         map[string]*scopeRule
+	flows         map[*scopeFlow]struct{}
+	unknownDenied uint64
 }
 type scopeFlow struct {
 	registry   *scopeRegistry
@@ -171,7 +172,11 @@ func (r *scopeRegistry) Enter(path, host string, udp bool, stop func()) (*scopeF
 		if !rule.subjects.matches(path, host) {
 			continue
 		}
-		if udp || !rule.drained || rule.outbound == "" || (path == "" && len(rule.subjects.Paths) > 0) || (outbound != "" && outbound != rule.outbound) {
+		if path == "" && len(rule.subjects.Paths) > 0 {
+			r.unknownDenied++
+			return nil, "", false
+		}
+		if udp || !rule.drained || rule.outbound == "" || (outbound != "" && outbound != rule.outbound) {
 			return nil, "", false
 		}
 		outbound = rule.outbound
@@ -275,3 +280,26 @@ func (r *scopeRegistry) forget(id, token string) error {
 	return nil
 }
 func ForgetScope(id, token string) error { return scopedFlows.forget(id, token) }
+
+type ScopeState struct {
+	ScopeSubjects
+	Drained  bool   `json:"drained"`
+	Outbound string `json:"outbound,omitempty"`
+}
+type ScopeReport struct {
+	Version       int                   `json:"version"`
+	Ready         bool                  `json:"ready"`
+	UnknownDenied uint64                `json:"unknownDenied"`
+	Scopes        map[string]ScopeState `json:"scopes"`
+}
+
+func RoutingScopeReport() ScopeReport {
+	r := scopedFlows
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	report := ScopeReport{Version: 1, Ready: r.loadErr == nil, UnknownDenied: r.unknownDenied, Scopes: make(map[string]ScopeState, len(r.rules))}
+	for id, s := range r.rules {
+		report.Scopes[id] = ScopeState{ScopeSubjects: s.subjects, Drained: s.drained, Outbound: s.outbound}
+	}
+	return report
+}

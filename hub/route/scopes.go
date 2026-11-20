@@ -26,6 +26,7 @@ func decodeScope(w http.ResponseWriter, r *http.Request, v any) bool {
 
 func scopeRouter() http.Handler {
 	r := chi.NewRouter()
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) { render.JSON(w, r, tunnel.RoutingScopeReport()) })
 	r.Put("/{id}/seal", func(w http.ResponseWriter, r *http.Request) {
 		var subjects tunnel.ScopeSubjects
 		if !decodeScope(w, r, &subjects) {
